@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/theupdateframework/go-tuf/client"
+	tuf_filejsonstore "github.com/theupdateframework/go-tuf/client/filejsonstore"
 	tuf_leveldbstore "github.com/theupdateframework/go-tuf/client/leveldbstore"
 	"github.com/theupdateframework/go-tuf/data"
 	_ "github.com/theupdateframework/go-tuf/pkg/deprecated/set_ecdsa"
@@ -56,6 +57,11 @@ const (
 
 	// SigstoreNoCache is the name of the environment variable that, if set, configures this code to only store root data in memory.
 	SigstoreNoCache = "SIGSTORE_NO_CACHE"
+
+	// LevelDB path
+	LevelDBPath = "tuf.db"
+	// File JSON path
+	FileJSONPath = "tuf.json"
 )
 
 var (
@@ -80,6 +86,24 @@ type TUF struct {
 	remote   client.RemoteStore
 	embedded fs.FS
 	mirror   string // location of mirror
+	// Prefer a value object over pointer to get sane defaults
+	opts     Options
+}
+
+// Options lets the client override some initialization parameters.
+type Options struct {
+	// Optional path where the metadata is located in the remote
+	// repository
+	RemoteMetadataPath string
+	// Optional path where the targets are located in the remote
+	// repository
+	RemoteTargetsPath string
+	// ForceUpdate indicates checking the remote for an update, even
+	//  when the local timestamp.json is up to date.
+	ForceUpdate bool
+	// FileJSONStore indicates if the metadata should be stored in
+	// raw JSON files or in level db (default).
+	FileJSONStore bool
 }
 
 // Mirror returns the mirror configured; note if the object was configured with a legacy reference
@@ -258,9 +282,8 @@ func GetRootStatus(ctx context.Context) (*RootStatus, error) {
 // defaults to the embedded root.json.
 // * embedded: An embedded filesystem that provides a trusted root and pre-downloaded
 // targets in a targets/ subfolder.
-// * forceUpdate: indicates checking the remote for an update, even when the local
-// timestamp.json is up to date.
-func initializeTUF(mirror string, root []byte, embedded fs.FS, forceUpdate bool) (*TUF, error) {
+// * options: Options for creating the client
+func initializeTUF(mirror string, root []byte, embedded fs.FS, opts *Options) (*TUF, error) {
 	initMu.Lock()
 	defer initMu.Unlock()
 
@@ -270,15 +293,16 @@ func initializeTUF(mirror string, root []byte, embedded fs.FS, forceUpdate bool)
 		t := &TUF{
 			mirror:   mirror,
 			embedded: embedded,
+			opts:     *opts,
 		}
 
 		t.targets = newFileImpl()
-		t.local, singletonTUFErr = newLocalStore()
+		t.local, singletonTUFErr = newLocalStore(opts)
 		if singletonTUFErr != nil {
 			return
 		}
 
-		t.remote, singletonTUFErr = remoteFromMirror(t.Mirror())
+		t.remote, singletonTUFErr = remoteFromMirror(t.Mirror(), opts)
 		if singletonTUFErr != nil {
 			return
 		}
@@ -319,7 +343,7 @@ func initializeTUF(mirror string, root []byte, embedded fs.FS, forceUpdate bool)
 
 	// We may already have an up-to-date local store! Check to see if it needs to be updated.
 	trustedTimestamp, ok := trustedMeta["timestamp.json"]
-	if ok && !isExpiredTimestamp(trustedTimestamp) && !forceUpdate {
+	if ok && !isExpiredTimestamp(trustedTimestamp) && !opts.ForceUpdate {
 		// We're golden so stash the TUF object for later use
 		return singletonTUF, nil
 	}
@@ -345,12 +369,22 @@ func NewFromEnv(_ context.Context) (*TUF, error) {
 	}
 
 	// Initializes a new TUF object from the local cache or defaults.
-	return initializeTUF(mirror, nil, getEmbedded(), false)
+	return initializeTUF(mirror, nil, getEmbedded(), &Options{})
 }
 
-func Initialize(_ context.Context, mirror string, root []byte) error {
+func Initialize(ctx context.Context, mirror string, root []byte) error {
 	// Initialize the client. Force an update with remote.
-	tuf, err := initializeTUF(mirror, root, getEmbedded(), true)
+	opts := Options{
+		ForceUpdate: true,
+	}
+
+	return InitializeWithOptions(ctx, mirror, root, &opts)
+}
+
+func InitializeWithOptions(_ context.Context, mirror string, root []byte, opts *Options) error {
+	// Set force update just in case
+	opts.ForceUpdate = true
+	tuf, err := initializeTUF(mirror, root, getEmbedded(), opts)
 	if err != nil {
 		return err
 	}
@@ -487,8 +521,15 @@ func (t *TUF) updateClient() (data.TargetFiles, error) {
 		return targets, nil
 	}
 	// Sync the on-disk cache with the metadata from the in-memory store.
-	tufDB := filepath.FromSlash(filepath.Join(rootCacheDir(), "tuf.db"))
-	diskLocal, err := tuf_leveldbstore.FileLocalStore(tufDB)
+	var diskLocal client.LocalStore
+	if t.opts.FileJSONStore {
+		tufDB := filepath.FromSlash(filepath.Join(rootCacheDir(), FileJSONPath))
+		diskLocal, err = tuf_filejsonstore.NewFileJSONStore(tufDB)
+	} else {
+		tufDB := filepath.FromSlash(filepath.Join(rootCacheDir(), LevelDBPath))
+		diskLocal, err = tuf_leveldbstore.FileLocalStore(tufDB)
+	}
+
 	defer func() {
 		if diskLocal != nil {
 			diskLocal.Close()
@@ -618,14 +659,23 @@ func syncLocalMeta(from, to client.LocalStore) error {
 }
 
 // Local store implementations
-func newLocalStore() (client.LocalStore, error) {
+func newLocalStore(opts *Options) (client.LocalStore, error) {
 	local := client.MemoryLocalStore()
 	if noCache() {
 		return local, nil
 	}
 	// Otherwise populate the in-memory local store with data fetched from the cache.
-	tufDB := filepath.FromSlash(filepath.Join(rootCacheDir(), "tuf.db"))
-	diskLocal, err := tuf_leveldbstore.FileLocalStore(tufDB)
+	var diskLocal client.LocalStore
+	var err error
+
+	if opts.FileJSONStore {
+		tufDB := filepath.FromSlash(filepath.Join(rootCacheDir(), FileJSONPath))
+		diskLocal, err = tuf_filejsonstore.NewFileJSONStore(tufDB)
+	} else {
+		tufDB := filepath.FromSlash(filepath.Join(rootCacheDir(), LevelDBPath))
+		diskLocal, err = tuf_leveldbstore.FileLocalStore(tufDB)
+	}
+
 	defer func() {
 		if diskLocal != nil {
 			diskLocal.Close()
@@ -727,14 +777,21 @@ func noCache() bool {
 	return b
 }
 
-func remoteFromMirror(mirror string) (client.RemoteStore, error) {
+func remoteFromMirror(mirror string, opts *Options) (client.RemoteStore, error) {
 	// This is for compatibility with specifying a GCS bucket remote.
 	u, parseErr := url.ParseRequestURI(mirror)
 	if parseErr != nil {
 		return client.HTTPRemoteStore(fmt.Sprintf("https://%s.storage.googleapis.com", mirror), nil, nil)
 	}
 	if u.Scheme != "file" {
-		return client.HTTPRemoteStore(mirror, nil, nil)
+		var httpOpts = client.HTTPRemoteOptions{}
+
+		if opts != nil {
+			httpOpts.MetadataPath = opts.RemoteMetadataPath
+			httpOpts.TargetsPath = opts.RemoteTargetsPath
+		}
+
+		return client.HTTPRemoteStore(mirror, &httpOpts, nil)
 	}
 	// Use local filesystem for remote.
 	return client.NewFileRemoteStore(os.DirFS(u.Path), "")
